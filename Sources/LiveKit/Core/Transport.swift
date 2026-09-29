@@ -142,6 +142,7 @@ actor Transport: NSObject, Loggable {
     }
 
     func set(remoteDescription sd: LKRTCSessionDescription) async throws {
+        let sd = Self.mungeOpusPtime(sd)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             _pc.setRemoteDescription(sd) { error in
                 if let error {
@@ -231,6 +232,37 @@ extension Transport {
     /// Munge SDP to change `a=inactive` to `a=recvonly` for RTP media m-lines in single PC mode.
     /// WebRTC can generate inactive direction even when transceivers were configured as recvonly.
     /// Only rewrites RTP m-sections — non-RTP sections (e.g. data channel `m=application`) are preserved.
+    /// Forces the Opus packetisation time by rewriting the answer before it is applied.
+    ///
+    /// The send-side frame size follows the negotiated `ptime` / `maxptime`, which arrive
+    /// in the remote description. Munging here rather than on the local offer also keeps
+    /// clear of libwebrtc's `IsSdpMungingAllowed` checks, which only police local
+    /// descriptions.
+    ///
+    /// Default 20 ms means 50 packets/second. Opus supports 10/20/40/60/80/100/120 ms.
+    /// `OpusPtime.preferredMs = 0` leaves the negotiation untouched.
+    static func mungeOpusPtime(_ sd: LKRTCSessionDescription) -> LKRTCSessionDescription {
+        let ms = OpusPtime.preferredMs
+        guard ms > 0 else { return sd }
+        var document = SDP(parsing: sd.sdp)
+        var changed = false
+        for index in document.mediaSections.indices where document.mediaSections[index].mediaType == "audio" {
+            let section = document.mediaSections[index]
+            guard section.isRTP, section.payload(forCodec: "opus") != nil else { continue }
+            // ptime states the preference, maxptime caps it; both are media-level.
+            if section.attributeValue("ptime") == nil {
+                document.mediaSections[index].append(line: "a=ptime:\(ms)")
+                changed = true
+            }
+            if section.attributeValue("maxptime") == nil {
+                document.mediaSections[index].append(line: "a=maxptime:\(ms)")
+                changed = true
+            }
+        }
+        guard changed else { return sd }
+        return LKRTCSessionDescription(type: sd.type, sdp: document.write())
+    }
+
     static func mungeInactiveToRecvOnlyForMedia(_ sdp: String) -> String {
         var document = SDP(parsing: sdp)
         for index in document.mediaSections.indices {
